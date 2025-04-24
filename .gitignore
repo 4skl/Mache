@@ -1,3 +1,4 @@
 img/*
+!img/.gitkeep
 *.mp4
 venv/
