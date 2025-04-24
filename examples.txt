@@ -1,0 +1,1 @@
+python .\make_video.py --resize_height 720 --format mp4 --di "[(0,1),(-1,2)]" --override
