@@ -2,6 +2,8 @@
 
 This project is a simple tool to create videos or GIFs from a collection of images stored in the `/img` directory.
 
+!!! Still under development !!!
+
 ## Features
 - Convert images into a video.
 - Generate GIFs from images.
