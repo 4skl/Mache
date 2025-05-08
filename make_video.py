@@ -27,9 +27,9 @@ FORMAT_EXTENSIONS = {
 # Define codecs for OpenCV fallback (simpler approach)
 OPENCV_FALLBACK_CODECS = {
     "mp4": "mp4v",
-    "avi": "XVID",  # Or MJPG
+    "avi": "MJPG",  # Use MJPG for best AVI compatibility
     "mov": "mp4v",
-    "wmv": "WMV2"  # Keep WMV as an option if explicitly requested
+    "wmv": "WMV2"
 }
 
 def print_progress(current, total, prefix='Progress:', suffix='Complete', length=50, fill='█', print_end='\r'):
@@ -83,6 +83,7 @@ def make_video_ffmpeg(image_folder, output_name, duration, images, resize_width,
             total_frames += frame_count
             
         processed_frames = 0
+        frame_idx = 0  # Use a running frame index for sequential naming
         for idx, image in enumerate(images):
             image_path = os.path.join(image_folder, image)
             frame = load_image(image_path)
@@ -95,54 +96,41 @@ def make_video_ffmpeg(image_folder, output_name, duration, images, resize_width,
             if resize_width and resize_height:
                 frame = cv2.resize(frame, (resize_width, resize_height))
                 
-            # Save frame to temp directory
-            frame_path = os.path.join(temp_dir, f"frame_{idx:05d}.png")
-            cv2.imwrite(frame_path, frame)
-            processed_frames += 1
-            
-            # Handle frame durations
+            # Save frame(s) to temp directory for duration
             frame_duration = next((d for i, d in durations if i == idx), duration)
-            if frame_duration > duration:
-                # For longer durations, create duplicate frames
-                factor = int(frame_duration / duration) - 1
-                for dup in range(1, factor+1):
-                    dup_path = os.path.join(temp_dir, f"frame_{idx:05d}_{dup}.png")
-                    cv2.imwrite(dup_path, frame)
-                    processed_frames += 1
-            
-            # Update progress
-            print_progress(processed_frames, total_frames, prefix='Preparing Frames:', suffix='Complete')
+            frame_count = int(frame_duration / duration)
+            for _ in range(frame_count):
+                frame_path = os.path.join(temp_dir, f"frame_{frame_idx:05d}.png")
+                cv2.imwrite(frame_path, frame)
+                frame_idx += 1
+                processed_frames += 1
+                print_progress(processed_frames, total_frames, prefix='Preparing Frames:', suffix='Complete')
         
         print("\nEncoding video with FFmpeg...")
         
-        # Use FFmpeg to create video with Windows-compatible settings
         fps = 1 / duration
-        
-        # Choose format-specific settings for maximum Windows compatibility
         format_ext = os.path.splitext(output_name)[1].lower()
         
-        # Base command structure
+        # Use sequential frame pattern for Windows compatibility
         cmd = [
             "ffmpeg",
             "-y",  # Overwrite output file
             "-framerate", str(fps),
-            "-pattern_type", "glob",
-            "-i", os.path.join(temp_dir, "*.png"),
+            "-start_number", "0",
+            "-i", os.path.join(temp_dir, "frame_%05d.png"),
         ]
 
         # Format-specific codec and options
         if format_ext == '.mp4':
-            # Use Main profile and Level 3.1 for broader WMP compatibility
-            print("Using FFmpeg with Main Profile Level 3.1 for MP4 (better WMP compatibility)")
+            print("Using FFmpeg with Baseline Profile Level 3.0 for MP4 (maximum WMP compatibility)")
             cmd.extend([
                 "-c:v", "libx264",
-                "-profile:v", "main",      # Changed from high to main
-                "-level", "3.1",           # Changed from 4.0 to 3.1
-                "-preset", "medium",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",     # Keep this for compatibility
-                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", # Keep ensuring even dimensions
-                "-movflags", "+faststart", # Keep for web/streaming
+                "-profile:v", "baseline",
+                "-level", "3.0",
+                "-b:v", "2M",
+                "-pix_fmt", "yuv420p",
+                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-movflags", "+faststart",
             ])
         elif format_ext == '.wmv':
             cmd.extend([
@@ -151,10 +139,11 @@ def make_video_ffmpeg(image_folder, output_name, duration, images, resize_width,
                 "-pix_fmt", "yuv420p",
             ])
         elif format_ext == '.avi':
+            print("Using FFmpeg with MJPEG codec for AVI (maximum compatibility)")
             cmd.extend([
-                "-c:v", "mpeg4",
-                "-q:v", "4",
-                "-pix_fmt", "yuv420p",
+                "-c:v", "mjpeg",
+                "-q:v", "3",
+                "-pix_fmt", "yuvj422p",
             ])
         else:
             cmd.extend([
@@ -229,17 +218,34 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
     # Normalize durations to handle negative indices
     durations = normalize_durations(durations, len(images))
 
-    # Read the first image to get dimensions
+    # Determine video dimensions
     first_image_path = os.path.join(image_folder, images[0])
-    frame = load_image(first_image_path)
+    first_frame_for_dims = load_image(first_image_path)
+    if first_frame_for_dims is None:
+        print(f"Error: Could not load the first image: {first_image_path}. Cannot determine dimensions.")
+        return
 
-    # Resize logic
-    if resize_width:
-        aspect_ratio = frame.shape[1] / frame.shape[0]
-        resize_height = resize_height or int(resize_width / aspect_ratio)
-        frame = cv2.resize(frame, (resize_width, resize_height))
-    else:
-        resize_width, resize_height = frame.shape[1], frame.shape[0]
+    original_frame_width = first_frame_for_dims.shape[1]
+    original_frame_height = first_frame_for_dims.shape[0]
+
+    video_width = resize_width  # User-provided or None
+    video_height = resize_height # User-provided or None
+
+    if video_width and not video_height:
+        # Width provided, calculate height
+        aspect_ratio = original_frame_height / original_frame_width # height/width
+        video_height = int(video_width * aspect_ratio)
+    elif not video_width and video_height:
+        # Height provided, calculate width
+        aspect_ratio = original_frame_width / original_frame_height # width/height
+        video_width = int(video_height * aspect_ratio)
+    elif not video_width and not video_height:
+        # Neither provided, use original dimensions of the first frame
+        video_width = original_frame_width
+        video_height = original_frame_height
+    # If both video_width and video_height are provided by user, they are used directly.
+
+    print(f"Target video dimensions: {video_width}x{video_height}")
 
     if output_format.lower() == "gif":
         frames = []
@@ -248,11 +254,15 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
         for idx, image in enumerate(images):
             image_path = os.path.join(image_folder, image)
             frame = load_image(image_path)
+            if frame is None:
+                print(f"\nWarning: Could not read image: {image_path}. Skipping this frame.")
+                continue
             
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            if resize_width:
-                frame_rgb = cv2.resize(frame_rgb, (resize_width, resize_height))
+            # Use calculated video_width and video_height for resizing
+            if video_width and video_height:
+                frame_rgb = cv2.resize(frame_rgb, (video_width, video_height))
             
             frame_duration = next((d for i, d in durations if i == idx), duration)
             
@@ -268,7 +278,8 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
     else:
         if check_ffmpeg():
             print("FFmpeg found. Using FFmpeg for video creation.")
-            if make_video_ffmpeg(image_folder, output_name, duration, images, resize_width, resize_height, durations):
+            # Pass calculated video_width and video_height to FFmpeg function
+            if make_video_ffmpeg(image_folder, output_name, duration, images, video_width, video_height, durations):
                 print(f"Video saved as {output_name}")
                 if output_format.lower() == 'mp4':
                     print("Attempted settings for improved Windows Media Player compatibility.")
@@ -281,6 +292,8 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
         print("Using OpenCV for video creation.")
         print("WARNING: OpenCV video creation may result in files incompatible with some players (like Windows Media Player).")
         print("For best results, please install FFmpeg.")
+        print("TIP: If you must use OpenCV, try '--format avi' for best compatibility, and play the result with VLC Media Player.")
+        print("NOTE: If your video does not play in Windows Media Player or Movies & TV, this is a limitation of OpenCV's video writer. The only reliable way to produce universally compatible video files is to use FFmpeg with H.264 or MPEG-4 codecs. VLC Media Player can play almost any video produced by OpenCV.")
 
         format_lower = output_format.lower()
         codec_tag = OPENCV_FALLBACK_CODECS.get(format_lower)
@@ -288,36 +301,48 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
         if not codec_tag:
             print(f"Error: Unsupported format '{output_format}' for OpenCV fallback.")
             print(f"Supported formats for OpenCV fallback: {', '.join(OPENCV_FALLBACK_CODECS.keys())}")
-            if 'mp4' in OPENCV_FALLBACK_CODECS:
-                print("Attempting MP4 format as a last resort.")
-                format_lower = 'mp4'
-                codec_tag = OPENCV_FALLBACK_CODECS['mp4']
-                output_name = ensure_correct_extension(os.path.splitext(output_name)[0], 'mp4')
+            if 'avi' in OPENCV_FALLBACK_CODECS:
+                print("Attempting AVI format as a last resort.")
+                format_lower = 'avi'
+                codec_tag = OPENCV_FALLBACK_CODECS['avi']
+                output_name = ensure_correct_extension(os.path.splitext(output_name)[0], 'avi')
             else:
                 print("Cannot proceed without a supported format.")
                 return
 
         print(f"Using OpenCV with format: {format_lower}, codec: {codec_tag}")
 
+        video = None  # Initialize video object outside try block
         try:
-            if resize_width % 2 != 0:
-                print(f"Warning: Adjusting width from {resize_width} to {resize_width - 1} for codec compatibility.")
-                resize_width -= 1
-            if resize_height % 2 != 0:
-                print(f"Warning: Adjusting height from {resize_height} to {resize_height - 1} for codec compatibility.")
-                resize_height -= 1
+            start_time = time.time()  # Start timing for OpenCV part
 
-            if resize_width <= 0 or resize_height <= 0:
-                print(f"Error: Invalid dimensions after adjustment ({resize_width}x{resize_height}). Cannot create video.")
+            # Use video_width and video_height for adjustments
+            adjusted_w = video_width
+            adjusted_h = video_height
+
+            if adjusted_w % 2 != 0:
+                print(f"Warning: Adjusting width from {adjusted_w} to {adjusted_w - 1} for codec compatibility.")
+                adjusted_w -= 1
+            if adjusted_h % 2 != 0:
+                print(f"Warning: Adjusting height from {adjusted_h} to {adjusted_h - 1} for codec compatibility.")
+                adjusted_h -= 1
+
+            if adjusted_w <= 0 or adjusted_h <= 0:
+                print(f"Error: Invalid dimensions after adjustment ({adjusted_w}x{adjusted_h}). Cannot create video.")
                 return
+            
+            print(f"OpenCV VideoWriter dimensions: {adjusted_w}x{adjusted_h}")
 
             fourcc = cv2.VideoWriter_fourcc(*codec_tag)
-            video = cv2.VideoWriter(output_name, fourcc, 1 / duration, (resize_width, resize_height))
+            video = cv2.VideoWriter(output_name, fourcc, 1 / duration, (adjusted_w, adjusted_h))
 
             if not video.isOpened():
                 print(f"Error: Could not open video writer with codec {codec_tag} for format {format_lower}.")
                 print("This might be due to missing codecs on your system or an unsupported format/codec combination with OpenCV.")
                 print("Please try installing FFmpeg for more reliable video creation.")
+                print("TIP: If you cannot install FFmpeg, try using '--format avi' for best compatibility with Windows Media Player, and play the result with VLC Media Player.")
+                print("NOTE: If you see a 'Permission denied' error, make sure the output file is not open in any program and you have write permissions in the folder.")
+                print("NOTE: If you see an OpenCV error about 'cv::VideoWriter_Images', check that your output filename ends with .avi or .mp4 and is not a folder or pattern.")
                 return
 
             total_frames = 0
@@ -337,8 +362,28 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
                     print(f"\nWarning: Could not read image: {image_path}. Skipping this frame.")
                     continue
 
-                if resize_width:
-                    frame = cv2.resize(frame, (resize_width, resize_height))
+                # Resize frame first to adjusted dimensions
+                if frame.shape[1] != adjusted_w or frame.shape[0] != adjusted_h:
+                    frame = cv2.resize(frame, (adjusted_w, adjusted_h))
+
+                # Ensure frame has exactly 3 channels (BGR)
+                if frame.ndim == 2:
+                    # Grayscale: stack to 3 channels
+                    frame = np.stack([frame]*3, axis=-1)
+                elif frame.shape[2] > 3:
+                    # More than 3 channels: crop to first 3
+                    frame = frame[:, :, :3]
+                elif frame.shape[2] < 3:
+                    print(f"Warning: Frame has less than 3 channels, skipping: {image_path}")
+                    continue
+
+                # Final check: shape must be (adjusted_h, adjusted_w, 3)
+                if frame.shape != (adjusted_h, adjusted_w, 3):
+                    print(f"Error: Frame shape after processing is {frame.shape}, expected ({adjusted_h}, {adjusted_w}, 3). Skipping frame.")
+                    continue
+                
+                # Ensure frame is C-contiguous
+                frame = np.ascontiguousarray(frame)
 
                 frame_duration = next((d for i, d in durations if i == idx), duration)
                 frame_count = int(frame_duration / duration)
@@ -349,14 +394,19 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
                     if frames_written % 5 == 0 or frames_written == total_frames:
                         print_progress(frames_written, total_frames, prefix='Creating Video:', suffix='Complete')
 
-            video.release()
+            elapsed = time.time() - start_time  # End timing
             print(f"\nVideo saved as {output_name} using OpenCV.")
+            print(f"Total processing time: {elapsed:.2f} seconds.")
             print("Note: If you encounter playback issues, try using VLC Media Player or install FFmpeg and rerun the script.")
         except Exception as e:
             print(f"Error creating video with OpenCV: {e}")
-            if 'fourcc' in locals() and not video.isOpened():
+            if 'fourcc' in locals() and video is not None and not video.isOpened(): # Check if video was initialized
                 print(f"Failed to initialize VideoWriter with FOURCC code: {codec_tag}. Check codec availability.")
             print("Consider installing FFmpeg for better video encoding capabilities.")
+        finally:
+            if video is not None and video.isOpened():
+                video.release()
+                print("OpenCV VideoWriter released.")
 
 def is_valid_image(file_path):
     try:
@@ -404,7 +454,7 @@ def normalize_durations(duration_list, num_images):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Create a stop-motion video from images in a folder.")
     parser.add_argument("--folder", type=str, default="./img", help="Path to the folder containing images.")
-    parser.add_argument("--format", type=str, default="mp4", 
+    parser.add_argument("--format", type=str, default="avi", 
                        choices=list(FORMAT_EXTENSIONS.keys()), 
                        help=f"Output format: {', '.join(FORMAT_EXTENSIONS.keys())}.")
     parser.add_argument("--output", type=str, default="output", help="Name of the output file (extension will be added based on format if missing).")
@@ -420,6 +470,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     args.output = ensure_correct_extension(args.output, args.format)
+    
+    overall_start_time = time.time()
 
     try:
         import ast
@@ -437,3 +489,6 @@ if __name__ == "__main__":
 
     make_video(args.folder, args.output, args.duration, args.reverse, args.skip_start, args.skip_end, durations, 
               args.resize_width, args.resize_height, args.override, args.format)
+
+    overall_elapsed_time = time.time() - overall_start_time
+    print(f"Total script execution time: {overall_elapsed_time:.2f} seconds.")
