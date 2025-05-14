@@ -2,13 +2,14 @@ import os
 import cv2
 import argparse
 import imageio  # Add imageio for GIF creation
-from PIL import Image  # Replace imghdr with Pillow
+from PIL import Image, ExifTags  # Replace imghdr with Pillow
 from pathlib import Path
 import numpy as np  # Import numpy for the codec detection
 import pillow_heif  # Import pillow_heif for HEIC support
 import subprocess  # For checking FFmpeg availability
 import sys  # For progress bar output
 import time  # For progress updates
+from datetime import datetime  # For metadata date handling
 
 # Register heif opener with pillow
 pillow_heif.register_heif_opener()
@@ -62,7 +63,276 @@ def check_ffmpeg():
     except (FileNotFoundError, subprocess.CalledProcessError, Exception):
         return False
 
-def make_video_ffmpeg(image_folder, output_name, duration, images, resize_width, resize_height, durations):
+def get_image_metadata_text(image_path, metadata_type="date", debug_mode=False):
+    """Extracts specified metadata from an image file."""
+    try:
+        # For filename metadata type, just return the filename
+        if metadata_type == "filename":
+            return os.path.basename(image_path)
+        
+        # Always open with PIL for EXIF handling
+        with Image.open(image_path) as img:
+            # For date metadata types, specifically prioritize original capture date
+            exif_data = {}
+            
+            # Try to get EXIF data - with additional error handling approaches
+            try:
+                # Method 1: Standard _getexif()
+                exif_raw = img._getexif()
+                if exif_raw:
+                    for tag_id, value in exif_raw.items():
+                        tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                        exif_data[tag_id] = value
+                        if debug_mode:
+                            print(f"EXIF: {tag_name} ({tag_id}) = {value}")
+            except (AttributeError, Exception) as e:
+                if debug_mode:
+                    print(f"Standard EXIF extraction failed: {e}")
+                
+                # Method 2: Try PIL's getexif() (newer method)
+                try:
+                    exif_raw = img.getexif()
+                    if exif_raw:
+                        for tag_id, value in exif_raw.items():
+                            tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                            exif_data[tag_id] = value
+                            if debug_mode:
+                                print(f"EXIF via getexif(): {tag_name} ({tag_id}) = {value}")
+                except Exception as e:
+                    if debug_mode:
+                        print(f"PIL getexif() failed: {e}")
+
+            # Check for EXIF in info dictionary for formats like PNG
+            if hasattr(img, 'info') and 'exif' in img.info:
+                if debug_mode:
+                    print(f"Found EXIF in image info dictionary")
+
+            # Define priority order for date tags with better comments
+            date_tag_priority = [
+                # Tag ID → Name mapping with highest priority first
+                (36867, 'DateTimeOriginal'),    # When photo was taken (highest priority)
+                (36868, 'DateTimeDigitized'),   # When photo was stored digitally
+                (306, 'DateTime'),              # When file was modified in-camera
+                (50971, 'PreviewDateTime'),     # Preview image date
+                (40960, 'FlashpixVersion')      # May indicate date in some formats
+            ]
+            
+            # For all metadata display (full metadata mode)
+            if metadata_type == "all" or metadata_type == "full":
+                metadata = []
+                # Add filename
+                metadata.append(f"File: {os.path.basename(image_path)}")
+                
+                # Try to get creation date with clear labeling of source
+                date_found = False
+                
+                # Start with EXIF data - highest priority
+                if exif_data:
+                    if debug_mode:
+                        print(f"Found {len(exif_data)} EXIF tags in {os.path.basename(image_path)}")
+                    
+                    # Look for date tags in priority order
+                    for tag_id, tag_name in date_tag_priority:
+                        if tag_id in exif_data and exif_data[tag_id] and str(exif_data[tag_id]).strip():
+                            dt_str = str(exif_data[tag_id]).strip()
+                            try:
+                                # Try common EXIF date format
+                                dt_obj = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+                                metadata.append(f"{tag_name}: {dt_obj.strftime('%Y-%m-%d %H:%M:%S')}")
+                                if debug_mode:
+                                    print(f"Using EXIF {tag_name} date: {dt_str}")
+                                date_found = True
+                                break
+                            except ValueError:
+                                try:
+                                    # Try alternate format
+                                    dt_obj = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+                                    metadata.append(f"{tag_name}: {dt_str}")
+                                    date_found = True
+                                    break
+                                except ValueError:
+                                    # Just add as raw string if can't parse
+                                    metadata.append(f"{tag_name}: {dt_str}")
+                                    date_found = True
+                                    break
+                
+                # If no EXIF date found, try file system dates
+                if not date_found:
+                    # Try to get original file stats
+                    try:
+                        # Get file stats for creation time (platform-specific)
+                        file_stats = os.stat(image_path)
+                        
+                        # Get creation time (Windows)
+                        try:
+                            creation_time = os.path.getctime(image_path)
+                            ct_obj = datetime.fromtimestamp(creation_time)
+                            metadata.append(f"File Created: {ct_obj.strftime('%Y-%m-%d %H:%M:%S')}")
+                            if debug_mode:
+                                print(f"Using file creation time: {ct_obj}")
+                        except Exception as e:
+                            if debug_mode:
+                                print(f"Couldn't get file creation time: {e}")
+                        
+                        # Get modification time (all platforms)
+                        file_time = os.path.getmtime(image_path)
+                        dt_obj = datetime.fromtimestamp(file_time)
+                        metadata.append(f"File Modified: {dt_obj.strftime('%Y-%m-%d %H:%M:%S')}")
+                        if debug_mode:
+                            print(f"Using file modification time: {dt_obj}")
+                            
+                    except Exception as e:
+                        metadata.append(f"File dates unavailable: {str(e)}")
+                        if debug_mode:
+                            print(f"Error getting file dates: {e}")
+                
+                return "\n".join(metadata)
+                
+            # Handle date or datetime metadata types with proper priority
+            if exif_data:
+                # Check each tag in priority order
+                for tag_id, tag_name in date_tag_priority:
+                    if tag_id in exif_data and exif_data[tag_id] and str(exif_data[tag_id]).strip():
+                        dt_str = str(exif_data[tag_id]).strip()
+                        try:
+                            # Standard EXIF date format
+                            dt_obj = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+                            # Format based on requested type
+                            if metadata_type == "date":
+                                if debug_mode:
+                                    print(f"Using EXIF {tag_name} date from {image_path}")
+                                return dt_obj.strftime("%Y-%m-%d")
+                            elif metadata_type == "datetime":
+                                return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+                            else:
+                                return dt_str
+                        except ValueError:
+                            # Try alternate format or return as-is
+                            try:
+                                dt_obj = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+                                if metadata_type == "date":
+                                    return dt_obj.strftime("%Y-%m-%d")
+                                elif metadata_type == "datetime": 
+                                    return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+                                else:
+                                    return dt_str
+                            except ValueError:
+                                # If parsing fails, return the raw string with label
+                                return f"{dt_str} (EXIF {tag_name})"
+            
+            if debug_mode:
+                print(f"No usable EXIF date found in {image_path}, trying file timestamps")
+        
+            # Try file creation time before modification time
+            try:
+                # Get file creation time (works on Windows)
+                creation_time = os.path.getctime(image_path)
+                ct_obj = datetime.fromtimestamp(creation_time)
+                if metadata_type == "date":
+                    return f"{ct_obj.strftime('%Y-%m-%d')} (created)"
+                elif metadata_type == "datetime":
+                    return f"{ct_obj.strftime('%Y-%m-%d %H:%M:%S')} (created)"
+                else:
+                    return f"{ct_obj.strftime('%Y-%m-%d %H:%M:%S')} (file created)"
+            except:
+                if debug_mode:
+                    print(f"Couldn't get file creation time, falling back to modification time")
+                
+            # Last resort: file modification time
+            file_time = os.path.getmtime(image_path)
+            dt_obj = datetime.fromtimestamp(file_time)
+            if metadata_type == "date":
+                return f"{dt_obj.strftime('%Y-%m-%d')} (mod)"
+            elif metadata_type == "datetime":
+                return f"{dt_obj.strftime('%Y-%m-%d %H:%M:%S')} (mod)"
+            else:
+                return f"{dt_obj.strftime('%Y-%m-%d %H:%M:%S')} (modified)"
+                
+    except Exception as e:
+        print(f"Warning: Error getting metadata for {image_path}: {e}")
+        return f"Error: {str(e)}"
+
+def parse_metadata_color(color_str):
+    """Parse color string to BGR tuple for OpenCV."""
+    # Define common color names
+    color_map = {
+        "white": (255, 255, 255),
+        "black": (0, 0, 0),
+        "red": (0, 0, 255),
+        "green": (0, 255, 0),
+        "blue": (255, 0, 0),
+        "yellow": (0, 255, 255),
+        "cyan": (255, 255, 0),
+        "magenta": (255, 0, 255)
+    }
+    
+    # Check if it's a named color
+    if color_str.lower() in color_map:
+        return color_map[color_str.lower()]
+        
+    # Try to parse as a tuple
+    try:
+        # Check if it's in the format "(B,G,R)" or "B,G,R"
+        if color_str.startswith("(") and color_str.endswith(")"):
+            color_str = color_str[1:-1]
+        
+        components = [int(x.strip()) for x in color_str.split(",")]
+        if len(components) == 3 and all(0 <= c <= 255 for c in components):
+            return tuple(components)
+    except:
+        pass
+        
+    # Default to white if parsing fails
+    print(f"Warning: Invalid color format '{color_str}'. Using white.")
+    return color_map["white"]
+
+def draw_metadata_on_frame(frame, text, position, color, font_scale, thickness):
+    """Draw metadata text on the frame at the specified position."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    # Get frame dimensions
+    height, width = frame.shape[:2]
+    
+    # Calculate text size
+    text_lines = text.split('\n')
+    line_heights = []
+    line_widths = []
+    
+    for line in text_lines:
+        (text_width, text_height), baseline = cv2.getTextSize(line, font, font_scale, thickness)
+        line_heights.append(text_height + baseline)
+        line_widths.append(text_width)
+    
+    # Total text block height
+    total_height = sum(line_heights)
+    max_width = max(line_widths) if line_widths else 0
+    
+    # Determine position coordinates
+    margin = 10
+    if position == "top-left":
+        x = margin
+        y = margin + line_heights[0]
+    elif position == "top-right":
+        x = width - max_width - margin
+        y = margin + line_heights[0]
+    elif position == "bottom-left":
+        x = margin
+        y = height - total_height - margin + line_heights[0]
+    else:  # bottom-right or default
+        x = width - max_width - margin
+        y = height - total_height - margin + line_heights[0]
+    
+    # Draw each line of text
+    current_y = y
+    for i, line in enumerate(text_lines):
+        cv2.putText(frame, line, (x, current_y), font, font_scale, color, thickness, cv2.LINE_AA)
+        if i < len(line_heights) - 1:  # Don't advance after the last line
+            current_y += line_heights[i]
+
+def make_video_ffmpeg(image_folder, output_name, duration, images, resize_width, resize_height, durations, 
+                      show_metadata=False, metadata_type="date", metadata_position="bottom-right", 
+                      metadata_color=(255,255,255), metadata_size=1.0, metadata_font_thickness=1,
+                      metadata_debug=False):  # <-- add metadata_debug
     """Create video using FFmpeg if available"""
     if not check_ffmpeg():
         print("FFmpeg not found. Please install FFmpeg for better video compatibility.")
@@ -95,6 +365,13 @@ def make_video_ffmpeg(image_folder, output_name, duration, images, resize_width,
             # Resize frame if needed
             if resize_width and resize_height:
                 frame = cv2.resize(frame, (resize_width, resize_height))
+            
+            # Add metadata text if enabled
+            if show_metadata:
+                metadata_text = get_image_metadata_text(image_path, metadata_type, debug_mode=metadata_debug)  # <-- pass debug_mode
+                if metadata_text:
+                    draw_metadata_on_frame(frame, metadata_text, metadata_position, metadata_color, 
+                                           metadata_size, metadata_font_thickness)
                 
             # Save frame(s) to temp directory for duration
             frame_duration = next((d for i, d in durations if i == idx), duration)
@@ -178,10 +455,13 @@ def make_video_ffmpeg(image_folder, output_name, duration, images, resize_width,
         print(f"FFmpeg processing error: {e}")
         return False
 
-def make_video(image_folder, output_name, duration, reverse, skip_start, skip_end, durations, resize_width, resize_height, override, output_format="mp4"):
+def make_video(image_folder, output_name, duration, reverse, skip_start, skip_end, durations, resize_width, resize_height, override, output_format="mp4",
+               show_metadata=False, metadata_type="date", metadata_position="bottom-right", metadata_color="white", 
+               metadata_size=1.0, metadata_font_thickness=1, metadata_debug=False):
     # Ensure output filename has the correct extension
     output_name = ensure_correct_extension(output_name, output_format)
-    
+    metadata_color_bgr = parse_metadata_color(metadata_color)
+
     # Check if the output file already exists
     if os.path.exists(output_name) and not override:
         while True:
@@ -264,6 +544,13 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
             if video_width and video_height:
                 frame_rgb = cv2.resize(frame_rgb, (video_width, video_height))
             
+            # Add metadata text if enabled
+            if show_metadata:
+                metadata_text = get_image_metadata_text(image_path, metadata_type, debug_mode=metadata_debug)  # <-- pass debug_mode
+                if metadata_text:
+                    draw_metadata_on_frame(frame_rgb, metadata_text, metadata_position, metadata_color_bgr, 
+                                           metadata_size, metadata_font_thickness)
+            
             frame_duration = next((d for i, d in durations if i == idx), duration)
             
             frame_count = int(frame_duration / duration)
@@ -276,73 +563,33 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
         imageio.mimsave(output_name, frames, duration=duration, loop=0)
         print(f"GIF saved as {output_name}")
     else:
-        if check_ffmpeg():
-            print("FFmpeg found. Using FFmpeg for video creation.")
-            # Pass calculated video_width and video_height to FFmpeg function
-            if make_video_ffmpeg(image_folder, output_name, duration, images, video_width, video_height, durations):
-                print(f"Video saved as {output_name}")
-                if output_format.lower() == 'mp4':
-                    print("Attempted settings for improved Windows Media Player compatibility.")
-                else:
-                    print("Video created successfully with FFmpeg.")
-                return
-            else:
-                print("FFmpeg video creation failed. Falling back to OpenCV (if possible).")
+        # Always create AVI first for compatibility
+        temp_avi = os.path.splitext(output_name)[0] + "_temp.avi"
+        format_lower = "avi"
+        codec_tag = OPENCV_FALLBACK_CODECS["avi"]
 
-        print("Using OpenCV for video creation.")
-        print("WARNING: OpenCV video creation may result in files incompatible with some players (like Windows Media Player).")
-        print("For best results, please install FFmpeg.")
-        print("TIP: If you must use OpenCV, try '--format avi' for best compatibility, and play the result with VLC Media Player.")
-        print("NOTE: If your video does not play in Windows Media Player or Movies & TV, this is a limitation of OpenCV's video writer. The only reliable way to produce universally compatible video files is to use FFmpeg with H.264 or MPEG-4 codecs. VLC Media Player can play almost any video produced by OpenCV.")
+        print(f"Creating temporary AVI video: {temp_avi}")
 
-        format_lower = output_format.lower()
-        codec_tag = OPENCV_FALLBACK_CODECS.get(format_lower)
-
-        if not codec_tag:
-            print(f"Error: Unsupported format '{output_format}' for OpenCV fallback.")
-            print(f"Supported formats for OpenCV fallback: {', '.join(OPENCV_FALLBACK_CODECS.keys())}")
-            if 'avi' in OPENCV_FALLBACK_CODECS:
-                print("Attempting AVI format as a last resort.")
-                format_lower = 'avi'
-                codec_tag = OPENCV_FALLBACK_CODECS['avi']
-                output_name = ensure_correct_extension(os.path.splitext(output_name)[0], 'avi')
-            else:
-                print("Cannot proceed without a supported format.")
-                return
-
-        print(f"Using OpenCV with format: {format_lower}, codec: {codec_tag}")
-
-        video = None  # Initialize video object outside try block
+        video = None
         try:
-            start_time = time.time()  # Start timing for OpenCV part
-
-            # Use video_width and video_height for adjustments
+            start_time = time.time()
             adjusted_w = video_width
             adjusted_h = video_height
-
             if adjusted_w % 2 != 0:
                 print(f"Warning: Adjusting width from {adjusted_w} to {adjusted_w - 1} for codec compatibility.")
                 adjusted_w -= 1
             if adjusted_h % 2 != 0:
                 print(f"Warning: Adjusting height from {adjusted_h} to {adjusted_h - 1} for codec compatibility.")
                 adjusted_h -= 1
-
             if adjusted_w <= 0 or adjusted_h <= 0:
                 print(f"Error: Invalid dimensions after adjustment ({adjusted_w}x{adjusted_h}). Cannot create video.")
                 return
-            
+
             print(f"OpenCV VideoWriter dimensions: {adjusted_w}x{adjusted_h}")
-
             fourcc = cv2.VideoWriter_fourcc(*codec_tag)
-            video = cv2.VideoWriter(output_name, fourcc, 1 / duration, (adjusted_w, adjusted_h))
-
+            video = cv2.VideoWriter(temp_avi, fourcc, 1 / duration, (adjusted_w, adjusted_h))
             if not video.isOpened():
-                print(f"Error: Could not open video writer with codec {codec_tag} for format {format_lower}.")
-                print("This might be due to missing codecs on your system or an unsupported format/codec combination with OpenCV.")
-                print("Please try installing FFmpeg for more reliable video creation.")
-                print("TIP: If you cannot install FFmpeg, try using '--format avi' for best compatibility with Windows Media Player, and play the result with VLC Media Player.")
-                print("NOTE: If you see a 'Permission denied' error, make sure the output file is not open in any program and you have write permissions in the folder.")
-                print("NOTE: If you see an OpenCV error about 'cv::VideoWriter_Images', check that your output filename ends with .avi or .mp4 and is not a folder or pattern.")
+                print(f"Error: Could not open video writer with codec {codec_tag} for AVI.")
                 return
 
             total_frames = 0
@@ -350,63 +597,115 @@ def make_video(image_folder, output_name, duration, reverse, skip_start, skip_en
                 frame_duration = next((d for i, d in durations if i == idx), duration)
                 frame_count = int(frame_duration / duration)
                 total_frames += frame_count
-            
+
             print(f"Creating video with {total_frames} frames...")
             frames_written = 0
-            
             for idx, image in enumerate(images):
                 image_path = os.path.join(image_folder, image)
                 frame = load_image(image_path)
-                
                 if frame is None:
                     print(f"\nWarning: Could not read image: {image_path}. Skipping this frame.")
                     continue
-
-                # Resize frame first to adjusted dimensions
                 if frame.shape[1] != adjusted_w or frame.shape[0] != adjusted_h:
                     frame = cv2.resize(frame, (adjusted_w, adjusted_h))
-
-                # Ensure frame has exactly 3 channels (BGR)
+                if show_metadata:
+                    metadata_text = get_image_metadata_text(image_path, metadata_type, debug_mode=metadata_debug)
+                    if metadata_text:
+                        draw_metadata_on_frame(frame, metadata_text, metadata_position, metadata_color_bgr,
+                                              metadata_size, metadata_font_thickness)
                 if frame.ndim == 2:
-                    # Grayscale: stack to 3 channels
                     frame = np.stack([frame]*3, axis=-1)
                 elif frame.shape[2] > 3:
-                    # More than 3 channels: crop to first 3
                     frame = frame[:, :, :3]
                 elif frame.shape[2] < 3:
                     print(f"Warning: Frame has less than 3 channels, skipping: {image_path}")
                     continue
-
-                # Final check: shape must be (adjusted_h, adjusted_w, 3)
                 if frame.shape != (adjusted_h, adjusted_w, 3):
                     print(f"Error: Frame shape after processing is {frame.shape}, expected ({adjusted_h}, {adjusted_w}, 3). Skipping frame.")
                     continue
-                
-                # Ensure frame is C-contiguous
                 frame = np.ascontiguousarray(frame)
-
                 frame_duration = next((d for i, d in durations if i == idx), duration)
                 frame_count = int(frame_duration / duration)
-
                 for _ in range(frame_count):
                     video.write(frame)
                     frames_written += 1
                     if frames_written % 5 == 0 or frames_written == total_frames:
                         print_progress(frames_written, total_frames, prefix='Creating Video:', suffix='Complete')
-
-            elapsed = time.time() - start_time  # End timing
-            print(f"\nVideo saved as {output_name} using OpenCV.")
+            elapsed = time.time() - start_time
+            print(f"\nTemporary AVI video saved as {temp_avi}.")
             print(f"Total processing time: {elapsed:.2f} seconds.")
-            print("Note: If you encounter playback issues, try using VLC Media Player or install FFmpeg and rerun the script.")
         except Exception as e:
             print(f"Error creating video with OpenCV: {e}")
-            if 'fourcc' in locals() and video is not None and not video.isOpened(): # Check if video was initialized
-                print(f"Failed to initialize VideoWriter with FOURCC code: {codec_tag}. Check codec availability.")
-            print("Consider installing FFmpeg for better video encoding capabilities.")
         finally:
             if video is not None and video.isOpened():
                 video.release()
                 print("OpenCV VideoWriter released.")
+
+        # If requested format is avi, just rename/move the temp file
+        if output_format.lower() == "avi":
+            if temp_avi != output_name:
+                os.replace(temp_avi, output_name)
+            print(f"Video saved as {output_name} (AVI, maximum compatibility).")
+            return
+
+        # If FFmpeg is available, convert AVI to requested format
+        if check_ffmpeg():
+            print(f"FFmpeg found. Converting AVI to {output_format}...")
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i", temp_avi,
+            ]
+            format_ext = os.path.splitext(output_name)[1].lower()
+            if format_ext == '.mp4':
+                cmd += [
+                    "-c:v", "libx264",
+                    "-profile:v", "baseline",
+                    "-level", "3.0",
+                    "-b:v", "2M",
+                    "-pix_fmt", "yuv420p",
+                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                    "-movflags", "+faststart",
+                ]
+            elif format_ext == '.wmv':
+                cmd += [
+                    "-c:v", "wmv2",
+                    "-b:v", "2M",
+                    "-pix_fmt", "yuv420p",
+                ]
+            elif format_ext == '.webm':
+                cmd += [
+                    "-c:v", "libvpx-vp9",
+                    "-b:v", "2M",
+                ]
+            elif format_ext == '.mov':
+                cmd += [
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                ]
+            elif format_ext == '.mkv':
+                cmd += [
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                ]
+            else:
+                cmd += [
+                    "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p",
+                ]
+            cmd.append(output_name)
+            print(f"Running FFmpeg command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"FFmpeg error: {result.stderr}")
+                print(f"Leaving temporary AVI at {temp_avi}")
+                return
+            else:
+                print(f"Video saved as {output_name} (converted from AVI).")
+                os.remove(temp_avi)
+        else:
+            print("FFmpeg not found. Only AVI output is available.")
+            print(f"Your video is at {temp_avi}. You may convert it manually if needed.")
 
 def is_valid_image(file_path):
     try:
@@ -467,6 +766,24 @@ if __name__ == "__main__":
     parser.add_argument("--resize_width", type=int, default=None, help="Resize width of the images (maintains aspect ratio if height is not set).")
     parser.add_argument("--resize_height", type=int, default=None, help="Resize height of the images.")
     parser.add_argument("--override", action="store_true", help="Override the output file if it already exists (default: False).")
+    
+    # Metadata display options
+    parser.add_argument("--show_metadata", action="store_true", help="Show metadata on the video frames.")
+    parser.add_argument("--metadata_type", type=str, default="date", 
+                        choices=["date", "datetime", "filename", "all", "full"],
+                        help="Type of metadata to display: date, datetime, filename, or all/full (default: date)")
+    parser.add_argument("--metadata_position", type=str, default="bottom-right",
+                        choices=["bottom-right", "bottom-left", "top-right", "top-left"],
+                        help="Position of metadata text (default: bottom-right)")
+    parser.add_argument("--metadata_color", type=str, default="white", 
+                        help="Color of metadata text. Can be name (white, black, red, green, blue, yellow, cyan, magenta) or BGR values like '255,255,255'")
+    parser.add_argument("--metadata_size", type=float, default=1.0,
+                        help="Font size for metadata text (default: 1.0)")
+    parser.add_argument("--metadata_font_thickness", type=int, default=1,
+                        help="Font thickness for metadata text (default: 1)")
+    parser.add_argument("--metadata_debug", action="store_true",
+                        help="Enable debug output for metadata extraction")
+    
     args = parser.parse_args()
 
     args.output = ensure_correct_extension(args.output, args.format)
@@ -488,7 +805,10 @@ if __name__ == "__main__":
         exit(1)
 
     make_video(args.folder, args.output, args.duration, args.reverse, args.skip_start, args.skip_end, durations, 
-              args.resize_width, args.resize_height, args.override, args.format)
+              args.resize_width, args.resize_height, args.override, args.format,
+              args.show_metadata, args.metadata_type, args.metadata_position,
+              args.metadata_color, args.metadata_size, args.metadata_font_thickness, 
+              metadata_debug=args.metadata_debug)
 
     overall_elapsed_time = time.time() - overall_start_time
     print(f"Total script execution time: {overall_elapsed_time:.2f} seconds.")
